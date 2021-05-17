@@ -13,6 +13,21 @@ Containers in kube-system/kube-apiserver-k8s-prod-m-1:
 - kube-apiserver: k8s.gcr.io/kube-apiserver:v1.20.4 2
 ```
 
+## Installation
+
+This is just a bash script, so download and execute:
+
+```
+$ wget https://raw.githubusercontent.com/awesome-it/kc/master/kc -O ~/.local/bin/kc
+$ chmod +x ~/local/bin/kc
+```
+
+Expand your `PATH` accordingly:
+
+```
+$ export PATH=$PATH:~/.local./bin
+```
+
 ## Usage
 
 ### List & Watch Resources
