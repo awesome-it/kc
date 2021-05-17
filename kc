@@ -1,0 +1,246 @@
+#!/bin/bash
+
+if [[ -z "$1" || "$1" == "--help" || "$1" == "-h" ]] ; then
+    echo "Usage:"
+    echo ""
+    echo "${dot}${bold} To watch resources having the given status or not, default is \"pod:!Succeeded\":${reset}"
+    echo "  $(basename $0) namespace watch resource[:status] [resource[:!status]"
+    echo ""
+    echo "${dot}${bold} To delete the selected namespace. Use \"force\" to force-delete by leaving possible dangling resources after wait duration has expired (default 20s):${reset}"
+    echo "  $(basename $0) namespace delete [force [wait_duration]]"
+    echo ""
+    echo "${dot}${bold} To start a maintenance container (default: praqma/network-multitool):${reset}"
+    echo "  $(basename $0) namespace maintenance [container] [command]"
+    echo ""
+    echo "${dot}${bold} To start the maintenance container on a specifiy node, export NODE as follows:${reset}"
+    echo "  export NODE='\"kubernetes.io/hostname\": \"k8s-prod-m-1\"'"
+    echo "  $(basename $0) namespace maintenance [container] [command]"
+    echo ""
+    echo "${dot}${bold} To override node tolerations, export TOLERATIONS as follows:${reset}"
+    echo "  export TOLERATIONS='[{\"effect\": \"NoSchedule\", \"key\": \"node-role.kubernetes.io/master\"}]'"
+    echo "  $(basename $0) namespace maintenance [container] [command]" 
+    echo ""
+    echo "${dot}${bold} To list containers of namespace/pod:${reset}"
+    echo "  $(basename $0) namespace/pod"
+    echo ""
+    echo "${dot}${bold} To delete the selected pod:${reset}"
+    echo "  $(basename $0) namespace/pod delete"
+    echo ""
+    echo "${dot}${bold} Describe the selected pod:${reset}"
+    echo "  $(basename $0) namespace/pod describe"
+    echo ""
+    echo "${dot}${bold} Show the labels of the selected pod:${reset}"
+    echo "  $(basename $0) namespace/pod labels"
+    echo ""
+    echo "${dot}${bold} Local edit of the file /path/to/edit in the selected container:${reset}"
+    echo "  $(basename $0) namespace/pod/container edit /path/to/edit"
+    echo ""
+    echo "${dot}${bold} Upload a file into the container:${reset}"
+    echo "  $(basename $0) namespace/pod/container (upload|up) /local/file /remote/file"
+    echo ""
+    echo "${dot}${bold} Download a file from the container:${reset}"
+    echo "  $(basename $0) namespace/pod/container (download|down) /remote/file /local/file"
+    echo ""
+    echo "${dot}${bold} Following log of a container (see kubectl logs --help):${reset}"
+    echo "  $(basename $0) namespace/pod[/container] logs"
+    echo ""
+    echo "${dot}${bold} Exec into a container: (see kubectl exec --help)${reset}"
+    echo "  $(basename $0) namespace/pod[/container] exec [command]"
+    echo ""
+    exit 1
+fi
+
+kubectl=$(which kubectl)
+ns_pattern=$(echo $1 | awk -F'/' '{print $1}')
+pod_pattern=$(echo $1 | awk -F'/' '{print $2}')
+container=$(echo $1 | awk -F'/' '{print $3}')
+shift # ns/pod/con
+
+if [[ ! -x $kubectl ]] ; then
+    echo "Command \"kubectl\" not found, exit."
+    exit 1
+fi
+
+# Stick to current context
+kubectl="${kubectl} --context $($kubectl config current-context)"
+
+namespace=$($kubectl get ns -o name | grep "$ns_pattern" | head -n1 | sed -s 's#namespace/##')
+if [[ -z "$namespace" ]] ; then
+	echo "Cannot find namespace using pattern \"$ns_pattern\". Available namespaces are: "
+	$kubectl get ns -o name | while read ns ; do echo " - $ns" | sed -s 's#namespaces/##' ; done
+	exit 1
+fi
+
+if [[ "$1" == "watch"  ]] ; then
+	shift
+
+    defaults=""
+    if [[ -z "$1" ]] ; then
+        defaults="pod:status.phase!=Succeeded"
+    fi
+
+    watch_expr=""
+    for resource in $@ $defaults ; do
+        field_selector="$(echo $resource | awk -F':' '{print $2}')"
+        resource="$(echo $resource | awk -F':' '{print $1}')"
+
+        if [[ -n "$field_selector" ]] ; then
+            field_selector="--field-selector=$field_selector"
+        fi
+
+        cmd="$kubectl -n=\"$namespace\" get \"$resource\" -o wide $(echo $field_selector | sed -s 's/Completed/Succeeded/g')"
+        watch_expr="${watch_expr}tput bold;tput setaf 3;echo ${cmd};echo -e \\\033[0m;$cmd; echo -e \\\n;"
+    done
+
+	exec watch -d -c -n 1 "bash -c '$watch_expr'"
+fi
+
+if [[ "$1"  == "maintenance" ]] ; then
+  
+  shift
+  
+  container=${1:-"praqma/network-multitool"}
+  shift
+  if [[ -z "$1" ]] ; then
+        command="sh -c (bash||sh)"
+        shift
+  fi
+  node_selector=""
+  if [[ -n "$NODE" ]] ; then
+      node_selector="\"nodeSelector\": { $NODE }"      
+      shift
+  fi
+  tolerations=""
+  if [[ -n "$TOLERATIONS" ]] ; then
+      tolerations=", \"tolerations\": $TOLERATIONS"
+  fi
+
+  if [[ -n "$node_selector" || -n "$tolerations" ]] ; then
+      overrides="{\"apiVersion\": \"v1\", \"spec\": { $node_selector $tolerations }}"
+  fi
+  exec $kubectl -n="$namespace" run -i --privileged --rm --tty maintenance --env="test=foobar" --image="$container" --overrides="$overrides" -- $command $@
+fi
+
+if [[ -z "$pod_pattern" && "$1" == "delete" ]] ; then
+
+  echo -n "${red}${bold}This will delete a whole namespace \"$namespace\". Press STRG-C to cancel or enter to continue ...${reset}"
+  cmd="$kubectl delete ns $namespace"
+  read
+
+  if [[ "$2" == "force" ]] ; then
+    wait_duration=${3:-"20s"}
+    $cmd &
+    pid=$!
+    echo "${dot} Waiting ${wait_duration} for deletion (pid: $pid) ..."
+    if timeout $wait_duration bash -c "while true; do kill -0 $pid &>/dev/null || exit 0 ; sleep 1 ; done" ;
+    then
+      retval=0
+    else
+      echo "${red}${bold}*${reset} Deletion did not return after ${wait_duration}. Force deleting ..."
+      $kubectl proxy &
+      proxy_pid=$!
+      finalizers=$(mktemp)
+      $kubectl get namespace $namespace -o json | jq '.spec = {"finalizers":[]}' >$finalizers
+      curl -k -H "Content-Type: application/json" -X PUT --data-binary @$finalizers 127.0.0.1:8001/api/v1/namespaces/$namespace/finalize &>/dev/null
+      rm $finalizers
+      kill $proxy_pid
+      wait $pid
+      retval=$?
+    fi
+  else
+    $cmd
+    retval=$?
+  fi
+
+  if [[ "$retval" == 0 ]] ; then
+    echo "${dot} Namespace \"$namespace\" deleted."
+    exit 0
+  fi
+
+  echo "${red}${bold}Error while deleting namespace \"$namespace\""
+  exit $retval
+fi
+
+if [[ -n "$pod_pattern" ]] ; then
+    for status in "Running" "Completed" ""
+    do
+    	pod=$($kubectl --namespace "$namespace" get po -o custom-columns=NAME:.metadata.name,STATUS:.status.phase | grep "$status" | grep "$pod_pattern" | head -n1 | awk '{print $1}')
+        test -n "$pod" && break
+    done
+	if [[ -z "$pod" ]] ; then
+		echo "Cannot find pod using pattern \"$pod_pattern\" in namespace \"$namespace\". Available pods are: "
+        $kubectl --namespace "$namespace" get po -o custom-columns=NAME:.metadata.name,STATUS:.status.phase | grep "Running" grep "$pod_pattern" | awk '{print $1}' | \
+            while read po ; do echo " - $po" ; done
+		exit 1
+	fi
+fi
+
+if [[ -z "$pod" && -z "$1" ]] ; then
+    echo "Pods in $namespace: "
+    exec $kubectl --namespace $namespace get pods -o wide
+fi
+
+if [[ -z "$container" && -z "$1" ]] ; then
+    set -e
+    
+    echo "Containers in $namespace/$pod: "
+    $kubectl --namespace $namespace get pod "$pod" -o json | jq -r '.status.initContainerStatuses[]? | select(.ready==true) | "${blue}- (init) ${reset}${green}" + .name + "${reset}: " + .image + " ${bold}${blue}" + (.restartCount|tostring) + "${reset}" ' | envsubst
+    $kubectl --namespace $namespace get pod "$pod" -o json | jq -r '.status.initContainerStatuses[]? | select(.ready==false) | "${bold}- (init) ${reset}${red}" + .name + "${reset}: " + .image + " ${bold}${blue}" + (.restartCount|tostring) + "${reset} " + (.state | to_entries[] | "${red}${bold}" + .key + "${reset}${red} (" + .value.reason + "): " + .value.message + "${reset}")' | envsubst
+    $kubectl --namespace $namespace get pod "$pod" -o json | jq -r '.status.containerStatuses[]? | select(.ready==true) | "${bold}- ${reset}${green}" + .name + "${reset}: " + .image + " ${bold}${blue}" + (.restartCount|tostring) + "${reset}" ' | envsubst
+    $kubectl --namespace $namespace get pod "$pod" -o json | jq -r '.status.containerStatuses[]? | select(.ready==false) | "${bold}- ${reset}${red}" + .name + "${reset}: " + .image + " ${bold}${blue}" + (.restartCount|tostring) + "${reset} " + (.state | to_entries[] | "${red}${bold}" + .key + "${reset}${red} (" + .value.reason + "): " + .value.message + "${reset}")' | envsubst
+    exit $?
+fi
+
+# Fuzzy search for container
+if [[ -n "$container" ]] ; then
+  container=$($kubectl --namespace $namespace get pod "$pod" -o json | jq '.spec.containers[].name' -r | grep "$container")
+fi
+
+if [[ "$1" == "logs" ]] ; then
+	shift
+	if which stern &>/dev/null
+	then
+	  labels=$(for l in $($kubectl -n=$namespace get po $pod -o json | jq '.metadata.labels | to_entries[] | .key + "=" + .value' -r) ; do echo -n "-l${l} " ; done)
+	  if [[ -n "$container" ]] ; then
+	    exec stern -n $namespace -c $container $labels $@
+	  else
+	    exec stern -n $namespace $labels $@
+	  fi
+  else
+	  exec $kubectl --namespace $namespace logs $@ $pod $container
+	fi
+elif [[ "$1" == "exec" ]] ; then
+	shift
+	if [[ -z "$1" ]] ; then
+	  command="sh -c (bash||sh)"
+	fi
+	exec $kubectl --namespace $namespace exec -t -i $pod -c $container -- $command $@
+elif [[ "$1" == "delete" ]] ; then
+    shift
+    exec $kubectl --namespace $namespace delete po $pod $@
+elif [[ "$1" == "describe" || $1 == "descr" ]] ; then
+    shift
+    exec $kubectl --namespace $namespace describe po $pod $@
+elif [[ "$1" == "labels" || $1 == "label" ]] ; then
+    shift
+    exec $kubectl --namespace $namespace get po $pod -o json | jq ".metadata.labels"
+elif [[ "$1" == "edit" ]] ; then
+    shift
+    file=$1
+    tmp=$(mktemp)
+    $kubectl --namespace "$namespace" cp "$pod:$file" -c "$container" "$tmp"
+    ${EDITOR:-vi} $tmp
+    exec $kubectl --namespace "$namespace" cp "$tmp" "$pod:$file" -c "$container"
+elif [[ "$1" == "upload" || "$1" == "up" ]] ; then
+    shift
+    local_file=$1
+    remote_file=$2
+    exec $kubectl --namespace "$namespace" cp "$local_file" "$pod:$remote_file" -c "$container"
+elif [[ "$1" == "download" || "$1" == "down" ]] ; then
+    shift
+    remote_file=$1
+    local_file=$2
+    exec $kubectl --namespace "$namespace" cp "$pod:$remote_file" -c "$container" "$local_file"
+else	
+    exec $kubectl --namespace $namespace $@
+fi
